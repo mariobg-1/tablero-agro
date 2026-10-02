@@ -32,8 +32,8 @@ ZONAS = ["Cuautla", "Ayala", "Tepalcingo"]
 st.sidebar.header("Parámetros")
 
 st.sidebar.subheader("Riesgo de tizón tardío")
-umbral_humedad = st.sidebar.slider("Humedad relativa de riesgo (%)", 50, 95, 70)
-temp_max_riesgo = st.sidebar.slider("Temperatura máxima de riesgo (°C)", 10, 30, 22)
+umbral_humedad = st.sidebar.slider("Humedad relativa de riesgo (%)", 50, 95, 80)
+temp_min_riesgo, temp_max_riesgo = st.sidebar.slider("Rango de temperatura de riesgo (°C)", 0, 30, (10, 17))
 ventana_horas = st.sidebar.radio("Ventana de cálculo", [48, 168], format_func=lambda h: f"{h} horas", index=1)
 
 st.sidebar.subheader("Riego")
@@ -101,12 +101,12 @@ def generar_lecturas(horas: int = 168, semilla: int = 7) -> pd.DataFrame:
     momentos = pd.date_range(end=pd.Timestamp.now().floor("h"), periods=horas, freq="h")
     ciclo_dia = np.sin((momentos.hour.to_numpy() - 6) / 24 * 2 * np.pi)  # calor de día, fresco de noche
     # Diferencias inventadas entre zonas para que el demo muestre los tres niveles de riesgo
-    extra_humedad = {"Cuautla": -14, "Ayala": -2, "Tepalcingo": 8}
+    extra_humedad = {"Cuautla": -14, "Ayala": -2, "Tepalcingo": 10}
     suelo_inicial = {"Cuautla": 52, "Ayala": 60, "Tepalcingo": 74}
     filas = []
     for zona in ZONAS:
-        temperatura = 23 + 7 * ciclo_dia + rng.normal(0, 1, horas)
-        humedad_aire = 66 - 16 * ciclo_dia + rng.normal(0, 4, horas) + extra_humedad[zona]
+        temperatura = 20 + 7 * ciclo_dia + rng.normal(0, 1, horas)  # noches frescas, como en otoño-invierno
+        humedad_aire = 70 - 16 * ciclo_dia + rng.normal(0, 4, horas) + extra_humedad[zona]
         humedad_suelo = suelo_inicial[zona] + rng.normal(0, 2, horas) - np.linspace(0, 8, horas)
         filas.append(
             pd.DataFrame(
@@ -139,15 +139,17 @@ lecturas = generar_lecturas()
 # 3. LÓGICA: riesgo, riego y rutas
 # ---------------------------------------------------------------------------
 def calcular_riesgo(df: pd.DataFrame) -> pd.DataFrame:
-    """Riesgo = % de horas de la ventana con humedad alta y temperatura fresca (favorables al tizón tardío)."""
+    """Riesgo = horas diarias con humedad alta y temperatura fresca, favorables al tizón tardío."""
     recientes = df[df["momento"] > df["momento"].max() - pd.Timedelta(hours=ventana_horas)].copy()
-    recientes["favorable"] = (recientes["humedad_aire"] >= umbral_humedad) & (
-        recientes["temperatura"] <= temp_max_riesgo
+    recientes["favorable"] = (recientes["humedad_aire"] >= umbral_humedad) & recientes["temperatura"].between(
+        temp_min_riesgo, temp_max_riesgo
     )
-    resumen = recientes.groupby("zona")["favorable"].agg(horas_favorables="sum", riesgo_pct="mean")
-    tabla = resumen.reindex(ZONAS).reset_index()
-    tabla["riesgo_pct"] = (tabla["riesgo_pct"] * 100).round(0)
-    tabla["nivel"] = pd.cut(tabla["riesgo_pct"], bins=[-1, 15, 35, 100], labels=["Bajo", "Medio", "Alto"]).astype(str)
+    tabla = recientes.groupby("zona")["favorable"].sum().rename("horas_favorables").reindex(ZONAS).reset_index()
+    tabla["horas_por_dia"] = (tabla["horas_favorables"] / (ventana_horas / 24)).round(1)
+    # Alto desde 8 horas diarias: es la duración mínima de un ciclo de infección en el estudio de referencia
+    tabla["nivel"] = pd.cut(
+        tabla["horas_por_dia"], bins=[0, 4, 8, 25], right=False, labels=["Bajo", "Medio", "Alto"]
+    ).astype(str)
     return tabla
 
 
@@ -296,6 +298,13 @@ def estado_frescura(parada: dict) -> str:
     return "En riesgo"
 
 
+def mostrar_grafica_fija(figura: go.Figure) -> None:
+    """Muestra una gráfica sin zoom ni arrastre, para que siempre se vea completa."""
+    figura.update_xaxes(fixedrange=True)
+    figura.update_yaxes(fixedrange=True)
+    st.plotly_chart(figura, config={"displayModeBar": False, "scrollZoom": False})
+
+
 riesgo = calcular_riesgo(lecturas)
 riego = calcular_riego(lecturas)
 zonas_en_riesgo_alto = list(riesgo.loc[riesgo["nivel"] == "Alto", "zona"])
@@ -309,15 +318,16 @@ tab_riesgo, tab_riego, tab_logistica, tab_fuentes = st.tabs(
 
 zonas_validadas = set()
 with tab_riesgo:
-    st.subheader(f"Riesgo de tizón tardío en las últimas {ventana_horas} horas, por zona")
+    st.subheader(f"Horas favorables al tizón tardío en las últimas {ventana_horas} horas, por zona")
     columnas = st.columns(len(riesgo))
     for columna, fila in zip(columnas, riesgo.itertuples()):
         columna.metric(
-            fila.zona, f"{fila.riesgo_pct:.0f} %", f"{fila.nivel} · {fila.horas_favorables} h favorables",
-            delta_color="off",
+            fila.zona, f"{fila.horas_por_dia:.1f} h al día", f"Riesgo {fila.nivel.lower()}", delta_color="off"
         )
     st.caption(
-        f"Hora favorable: humedad relativa de {umbral_humedad} % o más y temperatura de {temp_max_riesgo} °C o menos."
+        f"Hora favorable: humedad relativa de {umbral_humedad} % o más y temperatura entre {temp_min_riesgo} y "
+        f"{temp_max_riesgo} °C. Riesgo alto desde 8 horas favorables al día, la duración mínima de un ciclo de "
+        "infección en el estudio de referencia; medio de 4 a 8; bajo con menos de 4."
     )
 
     st.markdown("**Revisión humana antes de avisar**")
@@ -334,27 +344,73 @@ with tab_riesgo:
         else:
             st.caption(f"Aviso de {zona} retenido: no se envía hasta que el técnico lo valide.")
 
-    st.line_chart(lecturas.pivot(index="momento", columns="zona", values="humedad_aire"))
-    st.caption("Humedad del aire por zona (%).")
+    grafica = go.Figure()
+    for zona in ZONAS:
+        datos_zona = lecturas[lecturas["zona"] == zona]
+        grafica.add_trace(go.Scatter(x=datos_zona["momento"], y=datos_zona["humedad_aire"], mode="lines", name=zona))
+    grafica.add_hline(y=umbral_humedad, line_dash="dash", annotation_text=f"Umbral de riesgo: {umbral_humedad} %")
+    grafica.update_layout(
+        title="Humedad del aire por zona (%)", height=380, margin={"l": 10, "r": 10, "t": 50, "b": 10},
+        yaxis_range=[0, 100],
+    )
+    mostrar_grafica_fija(grafica)
 
     st.markdown("**Registro de revisión en parcela**")
     if "registros" not in st.session_state:
         st.session_state["registros"] = []
+        st.session_state["siguiente_id"] = 1
+    registros = st.session_state["registros"]
     with st.form("registro_revision", clear_on_submit=True):
         zona_registro = st.selectbox("Zona", ZONAS)
         con_sintomas = st.radio("¿Se encontraron síntomas?", ["No", "Sí"], horizontal=True)
         nota = st.text_input("Nota del productor o técnico")
         if st.form_submit_button("Guardar revisión"):
-            st.session_state["registros"].append(
-                {"fecha": date.today().isoformat(), "zona": zona_registro, "síntomas": con_sintomas, "nota": nota}
+            registros.append(
+                {
+                    "id": st.session_state["siguiente_id"],
+                    "fecha": date.today().isoformat(),
+                    "zona": zona_registro,
+                    "síntomas": con_sintomas,
+                    "nota": nota,
+                }
             )
-    if st.session_state["registros"]:
-        st.dataframe(pd.DataFrame(st.session_state["registros"]), hide_index=True)
+            st.session_state["siguiente_id"] += 1
+    if registros:
+        tabla_registros = pd.DataFrame(registros).drop(columns="id")
+        tabla_registros.index = pd.RangeIndex(1, len(registros) + 1, name="Núm.")
+        st.table(tabla_registros)
+        with st.expander("Corregir o borrar un registro"):
+            numero = st.selectbox("Número de registro", range(1, len(registros) + 1))
+            actual = registros[numero - 1]
+            clave = actual["id"]  # cada registro tiene su propio id para no mezclar los campos al borrar
+            zona_nueva = st.selectbox("Zona", ZONAS, index=ZONAS.index(actual["zona"]), key=f"zona_{clave}")
+            sintomas_nuevos = st.radio(
+                "¿Se encontraron síntomas?", ["No", "Sí"], index=["No", "Sí"].index(actual["síntomas"]),
+                horizontal=True, key=f"sintomas_{clave}",
+            )
+            nota_nueva = st.text_input("Nota", actual["nota"], key=f"nota_{clave}")
+            col_guardar, col_borrar = st.columns(2)
+            if col_guardar.button("Guardar cambios", key=f"guardar_{clave}"):
+                actual.update({"zona": zona_nueva, "síntomas": sintomas_nuevos, "nota": nota_nueva})
+                st.rerun()
+            if col_borrar.button("Borrar registro", key=f"borrar_{clave}"):
+                registros.pop(numero - 1)
+                st.rerun()
     st.caption("Estos registros sirven para calibrar los umbrales con lo que pasa en campo.")
 
 with tab_riego:
     st.subheader("Riego recomendado para hoy")
-    st.dataframe(riego, hide_index=True)
+    tabla_riego = riego.rename(
+        columns={
+            "zona": "Zona", "humedad_suelo": "Humedad del suelo (%)",
+            "litros_recomendados": "Litros recomendados", "ahorro_litros": "Ahorro (litros)",
+        }
+    ).set_index("Zona")
+    tabla_riego[["Litros recomendados", "Ahorro (litros)"]] = tabla_riego[
+        ["Litros recomendados", "Ahorro (litros)"]
+    ].astype(int)
+    tabla_riego["Humedad del suelo (%)"] = tabla_riego["Humedad del suelo (%)"].map("{:.1f}".format)
+    st.table(tabla_riego)
     st.metric("Ahorro frente al riego fijo (litros hoy)", f"{riego['ahorro_litros'].sum():,.0f}")
     for fila in riego.itertuples():
         if fila.litros_recomendados == 0 and fila.zona in zonas_en_riesgo_alto:
@@ -393,29 +449,15 @@ with tab_logistica:
     st.markdown("**Cada quien por su lado contra Ruta fresca**")
     ind, com = plan["individual"], plan["compartida"]
     kg_total = max(1, plan["kg"])
-    st.dataframe(
-        pd.DataFrame(
-            {
-                "Indicador": [
-                    "Viajes a la Central",
-                    "Kilómetros, ida y vuelta",
-                    "Costo de flete por kilo (MXN)",
-                    "Ocupación de vehículos (%)",
-                    "Horas de la carga a la Central",
-                    "Kilos en riesgo al llegar",
-                ],
-                "Por su lado": [
-                    ind["viajes"], round(ind["km"]), round(ind["costo"] / kg_total, 2),
-                    round(ind["ocupacion"] * 100), round(ind["horas"], 1), ind["kg_riesgo"],
-                ],
-                "Ruta fresca": [
-                    com["viajes"], round(com["km"]), round(com["costo"] / kg_total, 2),
-                    round(com["ocupacion"] * 100), round(com["horas"], 1), com["kg_riesgo"],
-                ],
-            }
-        ),
-        hide_index=True,
-    )
+    filas_comparacion = [
+        ("Viajes a la Central", f"{ind['viajes']}", f"{com['viajes']}"),
+        ("Kilómetros, ida y vuelta", f"{ind['km']:,.0f}", f"{com['km']:,.0f}"),
+        ("Costo de flete por kilo (MXN)", f"{ind['costo'] / kg_total:.2f}", f"{com['costo'] / kg_total:.2f}"),
+        ("Ocupación de vehículos (%)", f"{ind['ocupacion'] * 100:.0f}", f"{com['ocupacion'] * 100:.0f}"),
+        ("Horas de la carga a la Central", f"{ind['horas']:.1f}", f"{com['horas']:.1f}"),
+        ("Kilos en riesgo al llegar", f"{ind['kg_riesgo']:,.0f}", f"{com['kg_riesgo']:,.0f}"),
+    ]
+    st.table(pd.DataFrame(filas_comparacion, columns=["Indicador", "Por su lado", "Ruta fresca"]).set_index("Indicador"))
 
     mapa = go.Figure()
     for camion in plan["camiones"]:
@@ -429,7 +471,7 @@ with tab_logistica:
         )
         if camion["llegada"] > a_minutos(CENTRAL["hora_limite"]):
             st.error(f"Camión {camion['id']}: llega después del límite de {CENTRAL['hora_limite']}.")
-        st.dataframe(
+        st.table(
             pd.DataFrame(
                 [
                     {
@@ -437,15 +479,14 @@ with tab_logistica:
                         "Recolección": a_hora(p["recoleccion"]),
                         "Productor": p["nombre"],
                         "Municipio": p["municipio"],
-                        "Kg": p["kg"],
+                        "Kg": f"{p['kg']:,.0f}",
                         "Carga lista": p["hora_corte"],
-                        "Vida restante (h)": round(max(0, p["vida_restante"]), 1),
+                        "Vida restante (h)": f"{max(0, p['vida_restante']):.1f}",
                         "Estado": estado_frescura(p),
                     }
                     for i, p in enumerate(camion["paradas"], start=1)
                 ]
-            ),
-            hide_index=True,
+            ).set_index("Orden")
         )
         puntos = [SALIDA] + camion["paradas"]
         mapa.add_trace(
@@ -486,7 +527,7 @@ with tab_logistica:
         margin={"l": 10, "r": 10, "t": 50, "b": 10},
     )
     mapa.update_yaxes(scaleanchor="x", scaleratio=1)
-    st.plotly_chart(mapa)
+    mostrar_grafica_fija(mapa)
 
     with st.expander("Avisos a productores (vista previa, no se envían)"):
         for camion in plan["camiones"]:
@@ -504,9 +545,10 @@ with tab_fuentes:
     st.subheader("De dónde sale cada cosa")
     st.markdown(
         """
-- **Umbrales de tizón tardío:** humedad relativa mayor a 70 % y temperatura menor a 22 °C, según el manual
-  *Producción sustentable de jitomate en agricultura protegida* (ICAMEX, Gobierno del Estado de México, 2024).
-  No es una fuente de Morelos: hay que calibrarlos en campo.
+- **Umbrales de tizón tardío:** humedad relativa de 80 a 100 % y temperatura de 10 a 16.7 °C durante 8 a 13 horas
+  de noche y madrugada, según Delesma-Morales y colaboradores, *Revista Mexicana de Fitopatología*, 2020
+  (https://www.scielo.org.mx/scielo.php?script=sci_arttext&pid=S0185-33092020000100103).
+  El estudio es de Chapingo, Estado de México, a 2,250 m de altitud; no es de Morelos y hay que calibrarlo en campo.
 - **Producción de jitomate en Morelos:** 201,721 t y quinto lugar nacional en el cierre agrícola 2023 (SIAP).
   Pendiente de abrir la fuente original.
 - **Municipios de riego:** Cuautla, Ayala y Tepalcingo aparecen como zonas de riego en una nota de prensa de 2019.
