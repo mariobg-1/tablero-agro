@@ -1,16 +1,18 @@
 """Tablero agro para jitomate en la zona de riego del oriente de Morelos.
 
-Tres pestañas, un solo flujo de datos:
+Cuatro pestañas, un solo flujo de datos:
   1. Riesgo de tizón tardío a partir de humedad y temperatura.
   2. Riego recomendado según la humedad del suelo.
-  3. Rutas de recolección compartida (cálculo adaptado del demo "Ruta fresca").
+  3. Ciclo del cultivo: balance de agua diario (FAO-56) e índices de plagas para todo el ciclo.
+  4. Rutas de recolección compartida (cálculo adaptado del demo "Ruta fresca").
 
 Ejecutar con:  py -m streamlit run app.py
 """
 
 import math
 import re
-from datetime import date
+import unicodedata
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -40,6 +42,28 @@ st.sidebar.subheader("Riego")
 humedad_objetivo = st.sidebar.slider("Humedad de suelo objetivo (%)", 30, 80, 60)
 litros_por_punto = st.sidebar.number_input("Litros por punto de humedad faltante", 1, 500, 50)
 riego_fijo = st.sidebar.number_input("Riego fijo actual (litros por zona al día)", 0, 5000, 1200)
+
+SUELOS = {"Arenoso": 50, "Franco": 80, "Arcilloso": 110}  # agua disponible total en la zona de raíces (mm)
+SISTEMAS_RIEGO = {"Goteo": 85, "Aspersión": 75, "Surco o rodado": 60}  # eficiencia de aplicación (%)
+ESCENARIOS_CLIMA = {  # (grados de más, factor de lluvia, semilla)
+    "Normal": (0, 1.0, 11),
+    "Seco y cálido": (2, 0.35, 23),
+    "Lluvioso y fresco": (-1, 1.5, 37),
+}
+
+with st.sidebar.expander("Ciclo del cultivo: lote y supuestos"):
+    fecha_trasplante = st.date_input("Fecha de trasplante", date(2026, 10, 15))
+    invernadero = st.radio("Producción", ["Campo abierto", "Invernadero"], horizontal=True) == "Invernadero"
+    suelo = st.selectbox("Suelo", list(SUELOS), index=1)
+    sistema_riego = st.selectbox("Sistema de riego", list(SISTEMAS_RIEGO))
+    clima_elegido = st.selectbox("Clima del ciclo", [*ESCENARIOS_CLIMA, "Archivo CSV"])
+    archivo_clima = None
+    if clima_elegido == "Archivo CSV":
+        archivo_clima = st.file_uploader("CSV diario: fecha, tmax, tmin, lluvia (mm) y, opcional, hr (%)", type="csv")
+    dias_entre_riegos = st.number_input("Riego actual: días entre riegos", 1, 15, 3)
+    lamina_calendario = st.number_input("Riego actual: lámina por riego (mm)", 1, 60, 14)
+    costo_agua = st.number_input("Costo del agua (MXN por m³; 0 si no se sabe)", 0.0, 50.0, 0.0, 0.5)
+    umbral_medio_plagas, umbral_alto_plagas = st.slider("Índice de plagas: riesgo medio y alto", 0, 100, (35, 65))
 
 with st.sidebar.expander("Logística: supuestos del cálculo"):
     factor_camino = st.number_input("Factor de camino sobre línea recta", 1.0, 3.0, 1.35, 0.05)
@@ -133,6 +157,105 @@ def cargas_del_escenario(escenario: str) -> pd.DataFrame:
 
 
 lecturas = generar_lecturas()
+
+# Ciclo del cultivo. Duraciones y coeficientes de referencia tipo FAO-56 para jitomate; confirmar con INIFAP
+ETAPAS = [("Recién trasplantado", 30), ("Creciendo", 40), ("Floración y frutos", 45), ("Maduración y cosecha", 30)]
+DIAS_CICLO = sum(dias for _, dias in ETAPAS)
+KC_INICIAL, KC_MEDIO, KC_FINAL = 0.6, 1.15, 0.8
+AGOTAMIENTO_PERMISIBLE = 0.4  # fracción del agua del suelo que se puede gastar sin estrés
+UMBRAL_DEFICITARIO = 0.5  # el riego deficitario espera a que se gaste esta fracción
+KY = 1.05  # sensibilidad del rendimiento al estrés hídrico (Doorenbos y Kassam)
+LLUVIA_EFECTIVA, LLUVIA_MINIMA = 0.8, 5  # fracción que llega a la raíz; debajo de 5 mm se ignora
+FACTOR_INVERNADERO = 0.8  # menos radiación bajo plástico; ejemplo por medir
+LATITUD = 18.8
+ESTRATEGIAS = ["Riego actual", "Balance de agua", "Riego deficitario"]
+
+# Clima mensual de referencia del oriente de Morelos (aproximado): máxima, mínima y probabilidad de lluvia diaria
+TMAX_MES = [29, 31, 33, 34, 34, 31, 30, 30, 29, 29, 29, 28]
+TMIN_MES = [11, 12, 14, 16, 17, 18, 17, 17, 17, 15, 12, 11]
+PROB_LLUVIA_MES = [0.04, 0.04, 0.04, 0.08, 0.2, 0.5, 0.55, 0.55, 0.6, 0.3, 0.08, 0.04]
+
+# Umbrales de ejemplo para los índices de plagas; validar con un fitopatólogo
+PLAGAS = {
+    "Tizón tardío": {"rango": (12, 22), "revisar": "Manchas oscuras o aguadas en hojas y tallos, moho blanco por debajo."},
+    "Mosquita blanca": {"rango": (26, 32), "revisar": "Moscas blancas que vuelan al mover las hojas; hojas amarillas."},
+    "Palomilla del tomate": {"rango": None, "revisar": "Minas transparentes en las hojas y frutos con agujeritos."},
+}
+TUTA_BASE, TUTA_RITMO = 8, 22  # temperatura base y grados-día diarios del ritmo máximo
+MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+
+
+@st.cache_data
+def clima_sintetico(inicio: date, dias: int, escenario: str) -> pd.DataFrame:
+    """Clima diario inventado a partir del clima mensual de referencia, con rachas de calor y días de lluvia."""
+    grados_extra, factor_lluvia, semilla = ESCENARIOS_CLIMA[escenario]
+    rng = np.random.default_rng(semilla + inicio.toordinal())
+    anomalia, filas = 0.0, []
+    for i in range(dias):
+        dia = inicio + timedelta(days=i)
+        m = dia.month - 1
+        anomalia = 0.7 * anomalia + (rng.random() - 0.5) * 3
+        lluvia = 0.0
+        if rng.random() < min(0.9, PROB_LLUVIA_MES[m] * factor_lluvia):
+            lluvia = min(rng.exponential(12 if 5 <= m <= 9 else 6), 70)  # aguaceros más fuertes en temporal
+        mojado = lluvia > 0
+        filas.append(
+            {
+                "fecha": pd.Timestamp(dia),
+                "tmax": TMAX_MES[m] + grados_extra + anomalia - (3 if mojado else 0),
+                "tmin": TMIN_MES[m] + grados_extra * 0.5 + anomalia * 0.4 + (1 if mojado else 0),
+                "lluvia": round(lluvia, 1),
+                "hr": np.nan,
+            }
+        )
+    return pd.DataFrame(filas)
+
+
+def leer_clima_csv(archivo) -> pd.DataFrame:
+    """Lee un CSV diario. Acepta encabezados como fecha/date, tmax, tmin, lluvia/precip y hr/humedad."""
+    tabla = pd.read_csv(archivo, sep=None, engine="python")
+    tabla.columns = [
+        unicodedata.normalize("NFD", str(c).strip().lower()).encode("ascii", "ignore").decode() for c in tabla.columns
+    ]
+
+    def buscar(*prefijos):
+        return next((c for c in tabla.columns if c.startswith(prefijos)), None)
+
+    columnas = {
+        "fecha": buscar("fecha", "date"),
+        "tmax": buscar("tmax", "temp_max"),
+        "tmin": buscar("tmin", "temp_min"),
+        "lluvia": buscar("lluvia", "precip", "rain", "pp"),
+        "hr": buscar("hr", "rh", "humedad"),
+    }
+    faltan = [nombre for nombre, columna in columnas.items() if columna is None and nombre != "hr"]
+    if faltan:
+        raise ValueError(f"Al CSV le faltan columnas: {', '.join(faltan)}.")
+    clima = pd.DataFrame({nombre: tabla[c] if c else np.nan for nombre, c in columnas.items()})
+    fechas = pd.to_datetime(clima["fecha"], format="ISO8601", errors="coerce")
+    clima["fecha"] = fechas.fillna(pd.to_datetime(clima["fecha"], format="%d/%m/%Y", errors="coerce"))
+    for nombre in ["tmax", "tmin", "lluvia", "hr"]:
+        clima[nombre] = pd.to_numeric(clima[nombre], errors="coerce")
+    clima["lluvia"] = clima["lluvia"].fillna(0).clip(lower=0)
+    return clima.dropna(subset=["fecha", "tmax", "tmin"]).sort_values("fecha").reset_index(drop=True)
+
+
+origen_clima = clima_elegido
+clima_ciclo = None
+if archivo_clima is not None:
+    try:
+        desde_csv = leer_clima_csv(archivo_clima)
+        desde_csv = desde_csv[desde_csv["fecha"] >= pd.Timestamp(fecha_trasplante)].head(DIAS_CICLO)
+        if len(desde_csv) >= 7:
+            clima_ciclo = desde_csv.reset_index(drop=True)
+        else:
+            st.sidebar.warning("El CSV no tiene 7 días válidos desde el trasplante; se usa el clima normal.")
+    except ValueError as error:
+        st.sidebar.warning(f"No se pudo leer el CSV ({error}); se usa el clima normal.")
+if clima_ciclo is None:
+    if clima_elegido not in ESCENARIOS_CLIMA:
+        origen_clima = "Normal (falta un CSV válido)"
+    clima_ciclo = clima_sintetico(fecha_trasplante, DIAS_CICLO, clima_elegido if clima_elegido in ESCENARIOS_CLIMA else "Normal")
 
 
 # ---------------------------------------------------------------------------
@@ -305,15 +428,156 @@ def mostrar_grafica_fija(figura: go.Figure) -> None:
     st.plotly_chart(figura, config={"displayModeBar": False, "scrollZoom": False})
 
 
+def a_fecha(momento) -> str:
+    """Fecha corta en español, como '15 oct'."""
+    return f"{momento.day} {MESES[momento.month - 1]}"
+
+
+def etapa_del_dia(i: int) -> str:
+    """Nombre de la etapa del cultivo en el día i del ciclo (0 = trasplante)."""
+    acumulado = 0
+    for nombre, dias in ETAPAS:
+        acumulado += dias
+        if i < acumulado:
+            return nombre
+    return ETAPAS[-1][0]
+
+
+def kc_del_dia(i: int) -> float:
+    """Coeficiente de cultivo: fijo en etapas inicial y media, en línea recta durante el desarrollo y el final."""
+    ini, des, med, fin = (dias for _, dias in ETAPAS)
+    if i < ini:
+        return KC_INICIAL
+    if i < ini + des:
+        return KC_INICIAL + (KC_MEDIO - KC_INICIAL) * (i - ini) / des
+    if i < ini + des + med:
+        return KC_MEDIO
+    return KC_MEDIO + (KC_FINAL - KC_MEDIO) * min(1, (i - ini - des - med) / fin)
+
+
+def radiacion_extraterrestre(dia_anio: np.ndarray, latitud: float) -> np.ndarray:
+    """Radiación extraterrestre en mm de agua evaporable al día (ecuación 21 de FAO-56)."""
+    phi = np.radians(latitud)
+    dr = 1 + 0.033 * np.cos(2 * np.pi / 365 * dia_anio)
+    delta = 0.409 * np.sin(2 * np.pi / 365 * dia_anio - 1.39)
+    ws = np.arccos(np.clip(-np.tan(phi) * np.tan(delta), -1, 1))
+    ra = 24 * 60 / np.pi * 0.082 * dr * (ws * np.sin(phi) * np.sin(delta) + np.cos(phi) * np.cos(delta) * np.sin(ws))
+    return ra / 2.45
+
+
+def preparar_ciclo(clima: pd.DataFrame) -> pd.DataFrame:
+    """Agrega evapotranspiración de referencia (Hargreaves-Samani), del cultivo y lluvia efectiva."""
+    ciclo = clima.copy()
+    ciclo["tmedia"] = (ciclo["tmax"] + ciclo["tmin"]) / 2
+    ra = radiacion_extraterrestre(ciclo["fecha"].dt.dayofyear.to_numpy(), LATITUD)
+    ciclo["eto"] = (
+        0.0023 * (ciclo["tmedia"] + 17.8) * np.sqrt((ciclo["tmax"] - ciclo["tmin"]).clip(lower=0)) * ra
+    ).clip(lower=0) * (FACTOR_INVERNADERO if invernadero else 1)
+    ciclo["kc"] = [kc_del_dia(i) for i in range(len(ciclo))]
+    ciclo["etc"] = ciclo["kc"] * ciclo["eto"]
+    util = (ciclo["lluvia"] >= LLUVIA_MINIMA) & (not invernadero)
+    ciclo["lluvia_efectiva"] = np.where(util, ciclo["lluvia"] * LLUVIA_EFECTIVA, 0.0)
+    return ciclo
+
+
+def simular_riego(ciclo: pd.DataFrame, estrategia: str) -> dict:
+    """Balance diario del agua que le falta a la zona de raíces (FAO-56) con una estrategia de riego."""
+    taw = SUELOS[suelo]
+    raw = AGOTAMIENTO_PERMISIBLE * taw
+    eficiencia = SISTEMAS_RIEGO[sistema_riego] / 100
+    deficit, filas = 0.0, []
+    for i, dia in enumerate(ciclo.itertuples()):
+        inicial = deficit
+        if estrategia == "Riego actual":
+            lamina = float(lamina_calendario) if i % dias_entre_riegos == 0 else 0.0
+        elif estrategia == "Balance de agua":
+            lamina = inicial if inicial >= raw else 0.0  # repone justo antes de que la planta pase sed
+        else:
+            lamina = inicial if inicial >= UMBRAL_DEFICITARIO * taw else 0.0
+        tras_riego = max(0.0, inicial - lamina)  # el agua de más se pierde por debajo de la raíz
+        ks = 1.0 if tras_riego <= raw else max(0.0, (taw - tras_riego) / (taw - raw))
+        deficit = min(taw, max(0.0, tras_riego + ks * dia.etc - dia.lluvia_efectiva))
+        filas.append({"deficit_inicial": inicial, "riego": lamina, "ks": ks, "et_real": ks * dia.etc})
+    diario = pd.DataFrame(filas)
+    rendimiento = 1 - KY * (1 - diario["et_real"].sum() / max(1e-9, ciclo["etc"].sum()))
+    return {
+        "diario": diario,
+        "m3_ha": (diario["riego"] / eficiencia).sum() * 10,  # 1 mm sobre una hectárea son 10 m³
+        "riegos": int((diario["riego"] > 0).sum()),
+        "dias_estres": int((diario["ks"] < 1).sum()),
+        "rendimiento": min(1.0, max(0.0, rendimiento)),
+    }
+
+
+def trapecio(x, a: float, b: float, c: float, d: float) -> np.ndarray:
+    """Vale 1 dentro del rango favorable [b, c] y baja en línea recta hasta 0 en a y en d."""
+    x = np.asarray(x, dtype=float)
+    return np.clip(np.minimum((x - a) / (b - a), (d - x) / (d - c)), 0, 1)
+
+
+def indices_plagas(ciclo: pd.DataFrame) -> pd.DataFrame:
+    """Índice de 0 a 100 por plaga según la temperatura y la lluvia (o humedad) de los últimos días."""
+    t7 = ciclo["tmedia"].rolling(7, min_periods=1).mean()
+    lluvia7 = ciclo["lluvia"].rolling(7, min_periods=1).sum()
+    if invernadero:
+        humedad_respaldo = pd.Series(0.6, index=ciclo.index)
+    else:  # sin sensor de humedad, cuenta los días con lluvia de los últimos 5
+        humedad_respaldo = ((ciclo["lluvia"] >= 1).astype(int).rolling(5, min_periods=1).sum() / 3).clip(upper=1)
+    humedad = ((ciclo["hr"].rolling(7, min_periods=1).mean() - 70) / 20).clip(0, 1).fillna(humedad_respaldo)
+    grados_dia = ((np.minimum(ciclo["tmax"], 32) + np.maximum(ciclo["tmin"], TUTA_BASE)) / 2 - TUTA_BASE).clip(lower=0)
+    tiz_min, tiz_max = PLAGAS["Tizón tardío"]["rango"]
+    mos_min, mos_max = PLAGAS["Mosquita blanca"]["rango"]
+    return pd.DataFrame(
+        {
+            "Tizón tardío": 100 * trapecio(t7, tiz_min - 4, tiz_min, tiz_max, tiz_max + 4) * humedad,
+            "Mosquita blanca": 100
+            * trapecio(t7, mos_min - 4, mos_min, mos_max, mos_max + 4)
+            * (1 if invernadero else (1 - lluvia7 / 40).clip(0, 1)),
+            "Palomilla del tomate": 100 * (grados_dia.rolling(14, min_periods=1).mean() / TUTA_RITMO).clip(0, 1),
+        }
+    )
+
+
+def nivel_plaga(indice: float) -> str:
+    """Bajo, Medio o Alto según los umbrales de la barra lateral."""
+    if indice >= umbral_alto_plagas:
+        return "Alto"
+    return "Medio" if indice >= umbral_medio_plagas else "Bajo"
+
+
+def periodos_de_alerta(indices: pd.DataFrame, fechas: pd.Series) -> pd.DataFrame:
+    """Tramos de días seguidos en riesgo alto, por plaga, ordenados por fecha de inicio."""
+    filas = []
+    for plaga in indices.columns:
+        alto = indices[plaga] >= umbral_alto_plagas
+        tramos = (alto != alto.shift()).cumsum()
+        for _, tramo in indices.loc[alto, plaga].groupby(tramos[alto]):
+            filas.append(
+                {
+                    "inicio": tramo.index[0],
+                    "Plaga": plaga,
+                    "Desde": a_fecha(fechas[tramo.index[0]]),
+                    "Hasta": a_fecha(fechas[tramo.index[-1]]),
+                    "Índice máximo": f"{tramo.max():.0f}",
+                }
+            )
+    if not filas:
+        return pd.DataFrame()
+    return pd.DataFrame(filas).sort_values("inicio").drop(columns="inicio").set_index("Plaga")
+
+
 riesgo = calcular_riesgo(lecturas)
 riego = calcular_riego(lecturas)
+ciclo = preparar_ciclo(clima_ciclo)
+simulaciones = {estrategia: simular_riego(ciclo, estrategia) for estrategia in ESTRATEGIAS}
+indices = indices_plagas(ciclo)
 zonas_en_riesgo_alto = list(riesgo.loc[riesgo["nivel"] == "Alto", "zona"])
 
 # ---------------------------------------------------------------------------
 # 4. INTERFAZ: una pestaña por problemática del reto
 # ---------------------------------------------------------------------------
-tab_riesgo, tab_riego, tab_logistica, tab_fuentes = st.tabs(
-    ["Tizón tardío", "Agua", "Logística", "Fuentes y supuestos"]
+tab_riesgo, tab_riego, tab_ciclo, tab_logistica, tab_fuentes = st.tabs(
+    ["Tizón tardío", "Agua", "Ciclo del cultivo", "Logística", "Fuentes y supuestos"]
 )
 
 zonas_validadas = set()
@@ -423,6 +687,173 @@ with tab_riego:
     st.caption(
         "Cálculo: (humedad objetivo − humedad actual) × litros por punto. Regar solo lo que falta ahorra agua "
         "y evita el exceso de humedad que favorece al tizón tardío."
+    )
+
+with tab_ciclo:
+    st.subheader("Ciclo del cultivo: riego por balance de agua y alertas de plagas")
+    st.caption(
+        f"{'Invernadero' if invernadero else 'Campo abierto'} · suelo {suelo.lower()} · {sistema_riego.lower()} · "
+        f"trasplante el {a_fecha(ciclo['fecha'].iloc[0])} · clima: {origen_clima.lower()}. "
+        "Con clima de ejemplo, el cálculo es una demostración y no un pronóstico."
+    )
+    n_dias = len(ciclo)
+    dia = st.slider("Día del ciclo", 1, n_dias, min(60, n_dias)) - 1
+    hoy = ciclo.iloc[dia]
+    balance = simulaciones["Balance de agua"]["diario"]
+    taw = SUELOS[suelo]
+    raw = AGOTAMIENTO_PERMISIBLE * taw
+    eficiencia = SISTEMAS_RIEGO[sistema_riego] / 100
+    st.markdown(f"**{a_fecha(hoy['fecha'])}: día {dia + 1} de {n_dias}, {etapa_del_dia(dia).lower()}**")
+
+    col_riego, col_suelo = st.columns(2)
+    lamina_hoy = balance.at[dia, "riego"]
+    if lamina_hoy > 0:
+        m3_hoy = lamina_hoy / eficiencia * 10
+        col_riego.metric("Hoy toca regar", f"{lamina_hoy:.1f} litros por m²")
+        col_riego.caption(f"Con {sistema_riego.lower()} son unos {m3_hoy:,.0f} m³ por hectárea ({m3_hoy / 10:.1f} pipas de 10,000 litros).")
+    else:
+        col_riego.metric("Hoy no riegues", "0 litros por m²")
+        if hoy["etc"] > 0:
+            dias_faltan = max(1, math.ceil(max(0.0, raw - balance.at[dia, "deficit_inicial"]) / hoy["etc"]))
+            col_riego.caption(
+                f"El suelo todavía tiene agua. El próximo riego sería el "
+                f"{a_fecha(hoy['fecha'] + pd.Timedelta(days=dias_faltan))}, en unos {dias_faltan} día(s)."
+            )
+    agua_suelo = min(100.0, max(0.0, 100 * (taw - balance.at[dia, "deficit_inicial"]) / taw))
+    col_suelo.metric("Agua en el suelo", f"{agua_suelo:.0f} %")
+    col_suelo.progress(agua_suelo / 100)
+    col_suelo.caption(f"Toca regar cuando baja de {100 * (1 - AGOTAMIENTO_PERMISIBLE):.0f} %.")
+    if hoy["lluvia_efectiva"] > 0:
+        st.info(f"Hoy llovió {hoy['lluvia']:.0f} mm. Eso ya cuenta en el cálculo.")
+
+    st.markdown("**Plagas y enfermedades**")
+    plagas_altas = []
+    for columna, plaga in zip(st.columns(len(PLAGAS)), PLAGAS):
+        valor = indices.at[dia, plaga]
+        nivel = nivel_plaga(valor)
+        if nivel == "Alto":
+            plagas_altas.append(plaga)
+        columna.metric(plaga, f"{valor:.0f} de 100", f"Riesgo {nivel.lower()}", delta_color="off")
+        columna.caption(f"Qué revisar: {PLAGAS[plaga]['revisar']}")
+    if plagas_altas:
+        st.warning(
+            f"Riesgo alto de {' y '.join(p.lower() for p in plagas_altas)}. Revisar plantas y trampas hoy y "
+            "consultar al técnico antes de aplicar cualquier producto."
+        )
+    st.caption("El índice avisa cuándo revisar; no confirma que haya plaga.")
+
+    st.markdown("**Validación del técnico**")
+    bitacora = st.session_state.setdefault("bitacora_ciclo", {})
+    recomendacion = f"Regar {lamina_hoy:.1f} mm" if lamina_hoy > 0 else "No regar"
+    aviso_plagas = "Monitorear" if plagas_altas else "Sin alerta"
+    estados = ["Pendiente", "Validada", "Modificada"]
+    guardado = bitacora.get(dia, {})
+    estado = st.radio(
+        f"Recomendación del {a_fecha(hoy['fecha'])}: {recomendacion.lower()}; plagas: {aviso_plagas.lower()}",
+        estados, index=estados.index(guardado.get("Estado", "Pendiente")), horizontal=True, key=f"estado_ciclo_{dia}",
+    )
+    nota_ciclo = st.text_input("Nota del técnico", guardado.get("Nota", ""), key=f"nota_ciclo_{dia}")
+    if estado != "Pendiente" or nota_ciclo:
+        bitacora[dia] = {
+            "Fecha": a_fecha(hoy["fecha"]), "Riego": recomendacion, "Plagas": aviso_plagas,
+            "Estado": estado, "Nota": nota_ciclo,
+        }
+    else:
+        bitacora.pop(dia, None)
+    if bitacora:
+        st.table(pd.DataFrame([bitacora[d] for d in sorted(bitacora)]).set_index("Fecha"))
+
+    st.markdown("**Los próximos 7 días**")
+    semana = range(dia, min(n_dias, dia + 7))
+    st.table(
+        pd.DataFrame(
+            [
+                {
+                    "Fecha": a_fecha(ciclo.at[j, "fecha"]),
+                    "Riego (mm)": f"{balance.at[j, 'riego']:.1f}" if balance.at[j, "riego"] > 0 else "—",
+                    "Lluvia (mm)": f"{ciclo.at[j, 'lluvia']:.0f}" if ciclo.at[j, "lluvia"] > 0 else "—",
+                    "Riesgo alto de plagas": ", ".join(p for p in PLAGAS if indices.at[j, p] >= umbral_alto_plagas) or "—",
+                }
+                for j in semana
+            ]
+        ).set_index("Fecha")
+    )
+
+    st.markdown("**¿Cuánta agua se ahorra en todo el ciclo?**")
+    filas_estrategias = []
+    for estrategia, sim in simulaciones.items():
+        fila = {
+            "Estrategia": estrategia,
+            "Agua (m³ por ha)": f"{sim['m3_ha']:,.0f}",
+            "Riegos": sim["riegos"],
+            "Días con estrés": sim["dias_estres"],
+            "Rendimiento relativo (%)": f"{sim['rendimiento'] * 100:.0f}",
+        }
+        if costo_agua > 0:
+            fila["Costo del agua (MXN por ha)"] = f"{sim['m3_ha'] * costo_agua:,.0f}"
+        filas_estrategias.append(fila)
+    st.table(pd.DataFrame(filas_estrategias).set_index("Estrategia"))
+    actual, recomendado = simulaciones["Riego actual"], simulaciones["Balance de agua"]
+    diferencia = actual["m3_ha"] - recomendado["m3_ha"]
+    cambio_cosecha = (recomendado["rendimiento"] - actual["rendimiento"]) * 100
+    if diferencia >= 0.03 * actual["m3_ha"]:
+        cosecha = "sin bajar la cosecha estimada" if abs(cambio_cosecha) <= 0.5 else (
+            "y la cosecha estimada mejora" if cambio_cosecha > 0 else "con una pequeña baja en la cosecha estimada"
+        )
+        st.success(
+            f"Con el balance de agua se usan {diferencia:,.0f} m³ menos por hectárea "
+            f"({diferencia / actual['m3_ha'] * 100:.0f} % menos), {cosecha}."
+        )
+    elif diferencia <= -0.03 * actual["m3_ha"]:
+        st.warning(
+            f"En este ciclo el riego actual se queda corto: el balance de agua usa {-diferencia:,.0f} m³ más por "
+            "hectárea, pero la planta no pasa sed."
+        )
+    else:
+        st.info("El riego actual y el balance de agua gastan casi lo mismo.")
+    st.caption(
+        "Rendimiento relativo con la relación de Doorenbos y Kassam: 1 − Ky × (1 − ET real ÷ ET del cultivo). "
+        "El riego deficitario espera a que el suelo se seque más y acepta algo de estrés."
+    )
+
+    grafica_suelo = go.Figure()
+    for estrategia, sim in simulaciones.items():
+        grafica_suelo.add_trace(
+            go.Scatter(
+                x=ciclo["fecha"], y=100 * (taw - sim["diario"]["deficit_inicial"]) / taw, mode="lines", name=estrategia
+            )
+        )
+    grafica_suelo.add_hline(
+        y=100 * (1 - AGOTAMIENTO_PERMISIBLE), line_dash="dash", annotation_text="Límite sin estrés"
+    )
+    grafica_suelo.add_vline(x=hoy["fecha"], line_dash="dot", line_color="gray")
+    grafica_suelo.update_layout(
+        title="Agua en el suelo durante el ciclo (%)", height=380, margin={"l": 10, "r": 10, "t": 50, "b": 10},
+        yaxis_range=[0, 100],
+    )
+    mostrar_grafica_fija(grafica_suelo)
+
+    grafica_plagas = go.Figure()
+    for plaga in PLAGAS:
+        grafica_plagas.add_trace(go.Scatter(x=ciclo["fecha"], y=indices[plaga], mode="lines", name=plaga))
+    grafica_plagas.add_hline(y=umbral_medio_plagas, line_dash="dot", annotation_text="Riesgo medio")
+    grafica_plagas.add_hline(y=umbral_alto_plagas, line_dash="dash", annotation_text="Riesgo alto")
+    grafica_plagas.add_vline(x=hoy["fecha"], line_dash="dot", line_color="gray")
+    grafica_plagas.update_layout(
+        title="Índice de riesgo de plagas (0 a 100)", height=380, margin={"l": 10, "r": 10, "t": 50, "b": 10},
+        yaxis_range=[0, 100],
+    )
+    mostrar_grafica_fija(grafica_plagas)
+
+    alertas = periodos_de_alerta(indices, ciclo["fecha"])
+    if alertas.empty:
+        st.caption("Ninguna plaga llega a riesgo alto en este ciclo.")
+    else:
+        st.markdown("**Periodos con riesgo alto en el ciclo**")
+        st.table(alertas)
+    st.caption(
+        "El modelo no considera la salinidad, los conteos de trampas, el pronóstico de lluvia ni la humedad "
+        "medida en campo. Los valores no están calibrados para Morelos."
     )
 
 with tab_logistica:
@@ -556,5 +987,12 @@ with tab_fuentes:
 - **Lecturas de sensores:** simuladas. Las diferencias entre zonas son inventadas para la demostración.
 - **Cargas, vida útil, costos y velocidades:** supuestos del equipo, editables en pantalla.
 - **Cálculo de rutas:** adaptado del demo Ruta fresca del equipo; usa línea recta por un factor de camino.
+- **Ciclo del cultivo:** evapotranspiración de referencia con Hargreaves-Samani y balance de agua en la zona de raíces
+  según FAO-56 (Allen y colaboradores, 1998); rendimiento relativo con Doorenbos y Kassam (FAO-33, 1979).
+  Duraciones de etapas, Kc, agotamiento permisible y Ky son valores de referencia escritos de memoria: confirmar con
+  las tablas 11, 12 y 22 de FAO-56 o con INIFAP para Morelos.
+- **Clima del ciclo:** clima mensual aproximado del oriente de Morelos con variación inventada. Para usar datos reales,
+  subir un CSV diario (por ejemplo, de una estación del SMN o de la red agroclimática).
+- **Índices de plagas del ciclo:** rangos de temperatura y umbrales de ejemplo; validar con un fitopatólogo.
 """
     )
