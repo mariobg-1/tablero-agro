@@ -1,6 +1,11 @@
 """Tablero agro para jitomate en la zona de riego del oriente de Morelos.
 
-Cuatro pestañas, un solo flujo de datos:
+Dos modos en la barra lateral:
+  - Agricultor: ve la recomendación de hoy de su zona solo cuando el especialista ya la validó.
+  - Especialista: ajusta los parámetros, valida o cambia cada recomendación y ve las pestañas de análisis.
+
+Las pestañas del especialista comparten un solo flujo de datos:
+  0. Validar recomendaciones: riego y aviso de tizón de hoy, por zona.
   1. Riesgo de tizón tardío a partir de humedad y temperatura.
   2. Riego recomendado según la humedad del suelo.
   3. Ciclo del cultivo: balance de agua diario (FAO-56) e índices de plagas para todo el ciclo.
@@ -9,6 +14,7 @@ Cuatro pestañas, un solo flujo de datos:
 Ejecutar con:  py -m streamlit run app.py
 """
 
+import io
 import math
 import re
 import unicodedata
@@ -20,28 +26,49 @@ import plotly.graph_objects as go
 import streamlit as st
 
 st.set_page_config(page_title="Tablero agro jitomate", layout="wide")
-st.title("Tablero agro: tizón tardío, agua y logística del jitomate")
-st.caption(
-    "Prototipo de hackathon para Cuautla, Ayala y Tepalcingo, Morelos. Las lecturas de sensores y las "
-    "cargas son SIMULADAS; costos, velocidades, vida útil y litros son supuestos por validar."
-)
 
 ZONAS = ["Cuautla", "Ayala", "Tepalcingo"]
 
 # ---------------------------------------------------------------------------
-# 1. PARÁMETROS (barra lateral): todo lo ajustable vive aquí
+# 1. PARÁMETROS (barra lateral): todo lo ajustable vive aquí y solo lo ve el especialista
 # ---------------------------------------------------------------------------
-st.sidebar.header("Parámetros")
+modo = st.sidebar.radio("¿Quién usa el tablero?", ["Agricultor", "Especialista"], horizontal=True, key="modo")
+especialista = modo == "Especialista"
+PARAMETROS = st.session_state.setdefault("parametros", {})
 
-st.sidebar.subheader("Riesgo de tizón tardío")
-umbral_humedad = st.sidebar.slider("Humedad relativa de riesgo (%)", 50, 95, 80)
-temp_min_riesgo, temp_max_riesgo = st.sidebar.slider("Rango de temperatura de riesgo (°C)", 0, 30, (10, 17))
-ventana_horas = st.sidebar.radio("Ventana de cálculo", [48, 168], format_func=lambda h: f"{h} horas", index=1)
 
-st.sidebar.subheader("Riego")
-humedad_objetivo = st.sidebar.slider("Humedad de suelo objetivo (%)", 30, 80, 60)
-litros_por_punto = st.sidebar.number_input("Litros por punto de humedad faltante", 1, 500, 50)
-riego_fijo = st.sidebar.number_input("Riego fijo actual (litros por zona al día)", 0, 5000, 1200)
+def ajuste(clave: str, por_defecto, control):
+    """El especialista ve y mueve el control; el agricultor usa el último valor que dejó el especialista."""
+    PARAMETROS.setdefault(clave, por_defecto)
+    if especialista:
+        llave = f"par_{clave}"
+        if llave not in st.session_state:  # Streamlit borra el control al pasar por la vista del agricultor
+            st.session_state[llave] = PARAMETROS[clave]
+        PARAMETROS[clave] = control(llave)
+    return PARAMETROS[clave]
+
+
+if especialista:
+    st.sidebar.header("Parámetros del especialista")
+    st.sidebar.subheader("Riesgo de tizón tardío")
+umbral_humedad = ajuste("umbral_humedad", 80, lambda k: st.sidebar.slider("Humedad relativa de riesgo (%)", 50, 95, key=k))
+temp_min_riesgo, temp_max_riesgo = ajuste(
+    "rango_temp", (10, 17), lambda k: st.sidebar.slider("Rango de temperatura de riesgo (°C)", 0, 30, key=k)
+)
+ventana_horas = ajuste(
+    "ventana_horas", 168,
+    lambda k: st.sidebar.radio("Ventana de cálculo", [48, 168], format_func=lambda h: f"{h} horas", key=k),
+)
+
+if especialista:
+    st.sidebar.subheader("Riego")
+humedad_objetivo = ajuste("humedad_objetivo", 60, lambda k: st.sidebar.slider("Humedad de suelo objetivo (%)", 30, 80, key=k))
+litros_por_punto = ajuste(
+    "litros_por_punto", 50, lambda k: st.sidebar.number_input("Litros por punto de humedad faltante", 1, 500, key=k)
+)
+riego_fijo = ajuste(
+    "riego_fijo", 1200, lambda k: st.sidebar.number_input("Riego fijo actual (litros por zona al día)", 0, 5000, key=k)
+)
 
 SUELOS = {"Arenoso": 50, "Franco": 80, "Arcilloso": 110}  # agua disponible total en la zona de raíces (mm)
 SISTEMAS_RIEGO = {"Goteo": 85, "Aspersión": 75, "Surco o rodado": 60}  # eficiencia de aplicación (%)
@@ -51,35 +78,64 @@ ESCENARIOS_CLIMA = {  # (grados de más, factor de lluvia, semilla)
     "Lluvioso y fresco": (-1, 1.5, 37),
 }
 
-with st.sidebar.expander("Ciclo del cultivo: lote y supuestos"):
-    fecha_trasplante = st.date_input("Fecha de trasplante", date(2026, 10, 15))
-    invernadero = st.radio("Producción", ["Campo abierto", "Invernadero"], horizontal=True) == "Invernadero"
-    suelo = st.selectbox("Suelo", list(SUELOS), index=1)
-    sistema_riego = st.selectbox("Sistema de riego", list(SISTEMAS_RIEGO))
-    clima_elegido = st.selectbox("Clima del ciclo", [*ESCENARIOS_CLIMA, "Archivo CSV"])
-    archivo_clima = None
-    if clima_elegido == "Archivo CSV":
-        archivo_clima = st.file_uploader("CSV diario: fecha, tmax, tmin, lluvia (mm) y, opcional, hr (%)", type="csv")
-    dias_entre_riegos = st.number_input("Riego actual: días entre riegos", 1, 15, 3)
-    lamina_calendario = st.number_input("Riego actual: lámina por riego (mm)", 1, 60, 14)
-    costo_agua = st.number_input("Costo del agua (MXN por m³; 0 si no se sabe)", 0.0, 50.0, 0.0, 0.5)
-    umbral_medio_plagas, umbral_alto_plagas = st.slider("Índice de plagas: riesgo medio y alto", 0, 100, (35, 65))
+panel = st.sidebar.expander("Ciclo del cultivo: lote y supuestos") if especialista else None
+fecha_trasplante = ajuste("fecha_trasplante", date(2026, 10, 15), lambda k: panel.date_input("Fecha de trasplante", key=k))
+invernadero = ajuste(
+    "produccion", "Campo abierto",
+    lambda k: panel.radio("Producción", ["Campo abierto", "Invernadero"], horizontal=True, key=k),
+) == "Invernadero"
+suelo = ajuste("suelo", "Franco", lambda k: panel.selectbox("Suelo", list(SUELOS), key=k))
+sistema_riego = ajuste("sistema_riego", "Goteo", lambda k: panel.selectbox("Sistema de riego", list(SISTEMAS_RIEGO), key=k))
+clima_elegido = ajuste(
+    "clima", "Normal", lambda k: panel.selectbox("Clima del ciclo", [*ESCENARIOS_CLIMA, "Archivo CSV"], key=k)
+)
+if especialista and clima_elegido == "Archivo CSV":
+    # El archivo se guarda en bytes para que el cálculo siga igual en la vista del agricultor
+    subido = panel.file_uploader("CSV diario: fecha, tmax, tmin, lluvia (mm) y, opcional, hr (%)", type="csv")
+    if subido is not None:
+        PARAMETROS["archivo_clima"] = subido.getvalue()
+    elif PARAMETROS.get("archivo_clima"):
+        panel.caption("Se usa el último CSV que cargaste.")
+archivo_clima = None
+if clima_elegido == "Archivo CSV" and PARAMETROS.get("archivo_clima"):
+    archivo_clima = io.BytesIO(PARAMETROS["archivo_clima"])
+dias_entre_riegos = ajuste(
+    "dias_entre_riegos", 3, lambda k: panel.number_input("Riego actual: días entre riegos", 1, 15, key=k)
+)
+lamina_calendario = ajuste(
+    "lamina_calendario", 14, lambda k: panel.number_input("Riego actual: lámina por riego (mm)", 1, 60, key=k)
+)
+costo_agua = ajuste(
+    "costo_agua", 0.0,
+    lambda k: panel.number_input("Costo del agua (MXN por m³; 0 si no se sabe)", 0.0, 50.0, step=0.5, key=k),
+)
+umbral_medio_plagas, umbral_alto_plagas = ajuste(
+    "umbrales_plagas", (35, 65), lambda k: panel.slider("Índice de plagas: riesgo medio y alto", 0, 100, key=k)
+)
 
-with st.sidebar.expander("Logística: supuestos del cálculo"):
-    factor_camino = st.number_input("Factor de camino sobre línea recta", 1.0, 3.0, 1.35, 0.05)
-    vel_local = st.number_input("Velocidad entre parcelas (km/h)", 5, 90, 30)
-    vel_carretera = st.number_input("Velocidad a CDMX (km/h)", 5, 120, 55)
-    min_carga = st.number_input("Minutos de carga por parada", 0, 60, 10)
-    hora_salida = st.text_input("Salida de camiones (HH:MM)", "06:00")
-    if not re.fullmatch(r"\d{1,2}:\d{2}", hora_salida.strip()):
-        st.warning("Hora de salida no válida; se usa 06:00.")
-    cap_c1 = st.number_input("Capacidad C1 (kg)", 100, 20000, 3500, 100)
-    cap_c2 = st.number_input("Capacidad C2 (kg)", 100, 20000, 1500, 100)
-    costo_c1 = st.number_input("Costo C1 por km (MXN)", 1, 100, 18)
-    costo_c2 = st.number_input("Costo C2 por km (MXN)", 1, 100, 12)
-    cap_camioneta = st.number_input("Capacidad de camioneta individual (kg)", 50, 5000, 1000, 50)
-    costo_camioneta = st.number_input("Costo de camioneta por km (MXN)", 1, 100, 9)
-    horas_espera = st.number_input("Horas de espera del flete individual", 0.0, 12.0, 3.0, 0.5)
+panel = st.sidebar.expander("Logística: supuestos del cálculo") if especialista else None
+factor_camino = ajuste(
+    "factor_camino", 1.35, lambda k: panel.number_input("Factor de camino sobre línea recta", 1.0, 3.0, step=0.05, key=k)
+)
+vel_local = ajuste("vel_local", 30, lambda k: panel.number_input("Velocidad entre parcelas (km/h)", 5, 90, key=k))
+vel_carretera = ajuste("vel_carretera", 55, lambda k: panel.number_input("Velocidad a CDMX (km/h)", 5, 120, key=k))
+min_carga = ajuste("min_carga", 10, lambda k: panel.number_input("Minutos de carga por parada", 0, 60, key=k))
+hora_salida = ajuste("hora_salida", "06:00", lambda k: panel.text_input("Salida de camiones (HH:MM)", key=k))
+if especialista and not re.fullmatch(r"\d{1,2}:\d{2}", hora_salida.strip()):
+    panel.warning("Hora de salida no válida; se usa 06:00.")
+cap_c1 = ajuste("cap_c1", 3500, lambda k: panel.number_input("Capacidad C1 (kg)", 100, 20000, step=100, key=k))
+cap_c2 = ajuste("cap_c2", 1500, lambda k: panel.number_input("Capacidad C2 (kg)", 100, 20000, step=100, key=k))
+costo_c1 = ajuste("costo_c1", 18, lambda k: panel.number_input("Costo C1 por km (MXN)", 1, 100, key=k))
+costo_c2 = ajuste("costo_c2", 12, lambda k: panel.number_input("Costo C2 por km (MXN)", 1, 100, key=k))
+cap_camioneta = ajuste(
+    "cap_camioneta", 1000,
+    lambda k: panel.number_input("Capacidad de camioneta individual (kg)", 50, 5000, step=50, key=k),
+)
+costo_camioneta = ajuste("costo_camioneta", 9, lambda k: panel.number_input("Costo de camioneta por km (MXN)", 1, 100, key=k))
+horas_espera = ajuste(
+    "horas_espera", 3.0,
+    lambda k: panel.number_input("Horas de espera del flete individual", 0.0, 12.0, step=0.5, key=k),
+)
 
 # ---------------------------------------------------------------------------
 # 2. DATOS: sensores simulados y cargas de ejemplo (sustituir por datos reales)
@@ -573,14 +629,162 @@ simulaciones = {estrategia: simular_riego(ciclo, estrategia) for estrategia in E
 indices = indices_plagas(ciclo)
 zonas_en_riesgo_alto = list(riesgo.loc[riesgo["nivel"] == "Alto", "zona"])
 
+AVISO_TIZON = {
+    "Alto": "Riesgo alto de tizón tardío: revisar hoy hojas y tallos y ventilar el cultivo.",
+    "Medio": "Riesgo medio de tizón tardío: revisar el cultivo como de costumbre.",
+    "Bajo": "Riesgo bajo de tizón tardío: sin avisos.",
+}
+ESTADOS_VALIDACION = ["Pendiente", "Validada", "Cambiada"]
+validaciones = st.session_state.setdefault("validaciones", {})
+
+
+def recomendacion_del_dia(zona: str) -> dict:
+    """Lo que el modelo propone hoy para una zona: riego y aviso de tizón tardío."""
+    fila_riego = riego.set_index("zona").loc[zona]
+    nivel = riesgo.set_index("zona").at[zona, "nivel"]
+    litros = int(fila_riego["litros_recomendados"])
+    texto_riego = f"Regar {litros:,} litros hoy." if litros > 0 else "No regar hoy: el suelo ya tiene la humedad objetivo."
+    return {
+        "litros": litros,
+        "nivel": nivel,
+        "humedad_suelo": fila_riego["humedad_suelo"],
+        "riego": texto_riego,
+        "tizon": AVISO_TIZON[nivel],
+        "texto": f"{texto_riego} {AVISO_TIZON[nivel]}",
+    }
+
+
+def validacion_vigente(zona: str, recomendacion: dict):
+    """La decisión del especialista, solo si sigue siendo sobre la misma recomendación que da el modelo ahora."""
+    guardada = validaciones.get(zona)
+    if guardada and guardada["texto"] == recomendacion["texto"]:
+        return guardada
+    return None
+
+
+recomendaciones = {zona: recomendacion_del_dia(zona) for zona in ZONAS}
+zonas_validadas = {  # alertas de tizón confirmadas por el especialista; la logística les da prioridad
+    zona for zona in zonas_en_riesgo_alto
+    if (v := validacion_vigente(zona, recomendaciones[zona])) and v["estado"] == "Validada"
+}
+
+
+def guardar_revision(zona: str, con_sintomas: str, nota: str, quien: str) -> None:
+    """Agrega una revisión en parcela al registro que comparten el agricultor y el especialista."""
+    registros = st.session_state.setdefault("registros", [])
+    st.session_state.setdefault("siguiente_id", 1)
+    registros.append(
+        {
+            "id": st.session_state["siguiente_id"],
+            "fecha": date.today().isoformat(),
+            "zona": zona,
+            "síntomas": con_sintomas,
+            "nota": nota,
+            "registró": quien,
+        }
+    )
+    st.session_state["siguiente_id"] += 1
+
+
 # ---------------------------------------------------------------------------
-# 4. INTERFAZ: una pestaña por problemática del reto
+# 4A. VISTA DEL AGRICULTOR: solo ve lo que el especialista ya validó
 # ---------------------------------------------------------------------------
-tab_riesgo, tab_riego, tab_ciclo, tab_logistica, tab_fuentes = st.tabs(
-    ["Tizón tardío", "Agua", "Ciclo del cultivo", "Logística", "Fuentes y supuestos"]
+if not especialista:
+    st.title("Mi parcela de jitomate")
+    st.caption("Recomendaciones del día revisadas por tu técnico. Prototipo: las lecturas de sensores son simuladas.")
+    if "mi_zona" not in st.session_state:  # Streamlit borra el control al pasar por la vista del especialista
+        st.session_state["mi_zona"] = st.session_state.get("zona_guardada", ZONAS[0])
+    zona = st.selectbox("¿Dónde está tu parcela?", ZONAS, key="mi_zona")
+    st.session_state["zona_guardada"] = zona
+    recomendacion = recomendaciones[zona]
+    decision = validacion_vigente(zona, recomendacion)
+
+    if decision is None:
+        st.info(
+            "Tu técnico todavía no revisa la recomendación de hoy. Cuando la confirme, aparecerá aquí. "
+            "Mientras tanto, riega como de costumbre."
+        )
+    elif decision["estado"] == "Cambiada":
+        st.warning(f"Tu técnico revisó la recomendación de hoy y te indica: {decision['nota']}")
+    else:
+        if recomendacion["litros"] > 0:
+            st.header("Hoy toca regar")
+            st.metric("Agua para hoy", f"{recomendacion['litros']:,} litros")
+        else:
+            st.header("Hoy no riegues")
+            st.write("Tu suelo todavía tiene la humedad que necesita el cultivo.")
+        mostrar_aviso = {"Alto": st.error, "Medio": st.warning, "Bajo": st.success}[recomendacion["nivel"]]
+        mostrar_aviso(recomendacion["tizon"])
+        if decision["nota"]:
+            st.info(f"Nota de tu técnico: {decision['nota']}")
+        st.caption(f"Confirmado por tu técnico a las {decision['hora']}. Esta herramienta nunca receta productos.")
+
+    st.subheader("Cuéntale a tu técnico qué viste hoy")
+    with st.form("revision_agricultor", clear_on_submit=True):
+        con_sintomas = st.radio(
+            "¿Viste manchas oscuras en hojas o tallos, o moho blanco debajo de las hojas?", ["No", "Sí"], horizontal=True
+        )
+        nota = st.text_input("Algo más que quieras contarle (opcional)")
+        if st.form_submit_button("Enviar a mi técnico"):
+            guardar_revision(zona, con_sintomas, nota, "Agricultor")
+            st.success("Listo, tu técnico lo verá en su tablero.")
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# 4B. VISTA DEL ESPECIALISTA: una pestaña por problemática del reto
+# ---------------------------------------------------------------------------
+st.title("Tablero agro: tizón tardío, agua y logística del jitomate")
+st.caption(
+    "Prototipo de hackathon para Cuautla, Ayala y Tepalcingo, Morelos. Las lecturas de sensores y las "
+    "cargas son SIMULADAS; costos, velocidades, vida útil y litros son supuestos por validar."
+)
+tab_validar, tab_riesgo, tab_riego, tab_ciclo, tab_logistica, tab_fuentes = st.tabs(
+    ["Validar recomendaciones", "Tizón tardío", "Agua", "Ciclo del cultivo", "Logística", "Fuentes y supuestos"]
 )
 
-zonas_validadas = set()
+with tab_validar:
+    st.subheader("Recomendaciones de hoy por zona")
+    st.caption(
+        "Nada llega al agricultor hasta que lo valides. Si la recomendación cambia porque moviste un parámetro, "
+        "vuelve a quedar pendiente."
+    )
+    for zona, recomendacion in recomendaciones.items():
+        with st.container(border=True):
+            st.markdown(f"**{zona}**")
+            st.write(recomendacion["texto"])
+            fila_riesgo = riesgo.set_index("zona").loc[zona]
+            st.caption(
+                f"Humedad del suelo {recomendacion['humedad_suelo']:.1f} % (objetivo {humedad_objetivo} %). "
+                f"{fila_riesgo['horas_por_dia']:.1f} horas al día favorables al tizón."
+            )
+            vigente = validacion_vigente(zona, recomendacion) or {}
+            sufijo = f"{zona}_{recomendacion['litros']}_{recomendacion['nivel']}"  # se reinicia si cambia la recomendación
+            estado = st.radio(
+                "Decisión", ESTADOS_VALIDACION, index=ESTADOS_VALIDACION.index(vigente.get("estado", "Pendiente")),
+                format_func={"Pendiente": "Pendiente", "Validada": "Validar", "Cambiada": "Cambiar"}.get,
+                horizontal=True, key=f"decision_{sufijo}",
+            )
+            nota = st.text_input(
+                "Indicación para el agricultor" if estado == "Cambiada" else "Nota para el agricultor (opcional)",
+                vigente.get("nota", ""), key=f"nota_{sufijo}",
+            )
+            if estado == "Cambiada" and not nota.strip():
+                st.warning("Escribe qué debe hacer el agricultor; sin indicación no se le envía nada.")
+                validaciones.pop(zona, None)
+            elif estado == "Pendiente":
+                validaciones.pop(zona, None)
+                st.caption("Retenida: el agricultor ve que su técnico todavía no la revisa.")
+            else:
+                if vigente.get("estado") != estado or vigente.get("nota") != nota:
+                    vigente = {"texto": recomendacion["texto"], "estado": estado, "nota": nota,
+                               "hora": pd.Timestamp.now().strftime("%H:%M")}
+                validaciones[zona] = vigente
+                st.success(f"{'Validada' if estado == 'Validada' else 'Cambiada'} a las {vigente['hora']}: ya la ve el agricultor.")
+    zonas_validadas = {
+        zona for zona in zonas_en_riesgo_alto
+        if (v := validacion_vigente(zona, recomendaciones[zona])) and v["estado"] == "Validada"
+    }
+
 with tab_riesgo:
     st.subheader(f"Horas favorables al tizón tardío en las últimas {ventana_horas} horas, por zona")
     columnas = st.columns(len(riesgo))
@@ -598,15 +802,10 @@ with tab_riesgo:
     if not zonas_en_riesgo_alto:
         st.info("Ninguna zona está en riesgo alto con los umbrales actuales.")
     for zona in zonas_en_riesgo_alto:
-        st.warning(f"{zona}: riesgo alto. Requiere validación del técnico de sanidad vegetal.")
-        if st.checkbox(f"El técnico validó la alerta de {zona} en campo", key=f"valida_{zona}"):
-            zonas_validadas.add(zona)
-            st.success(
-                f"Aviso liberado para productores de {zona}: revisar hojas y tallos hoy, ventilar el cultivo "
-                "y consultar al técnico antes de cualquier aplicación."
-            )
+        if zona in zonas_validadas:
+            st.success(f"{zona}: riesgo alto. Aviso validado y enviado al agricultor.")
         else:
-            st.caption(f"Aviso de {zona} retenido: no se envía hasta que el técnico lo valide.")
+            st.warning(f"{zona}: riesgo alto. Aviso retenido hasta que lo valides en la pestaña Validar recomendaciones.")
 
     grafica = go.Figure()
     for zona in ZONAS:
@@ -620,25 +819,13 @@ with tab_riesgo:
     mostrar_grafica_fija(grafica)
 
     st.markdown("**Registro de revisión en parcela**")
-    if "registros" not in st.session_state:
-        st.session_state["registros"] = []
-        st.session_state["siguiente_id"] = 1
-    registros = st.session_state["registros"]
+    registros = st.session_state.setdefault("registros", [])
     with st.form("registro_revision", clear_on_submit=True):
         zona_registro = st.selectbox("Zona", ZONAS)
         con_sintomas = st.radio("¿Se encontraron síntomas?", ["No", "Sí"], horizontal=True)
         nota = st.text_input("Nota del productor o técnico")
         if st.form_submit_button("Guardar revisión"):
-            registros.append(
-                {
-                    "id": st.session_state["siguiente_id"],
-                    "fecha": date.today().isoformat(),
-                    "zona": zona_registro,
-                    "síntomas": con_sintomas,
-                    "nota": nota,
-                }
-            )
-            st.session_state["siguiente_id"] += 1
+            guardar_revision(zona_registro, con_sintomas, nota, "Especialista")
     if registros:
         tabla_registros = pd.DataFrame(registros).drop(columns="id")
         tabla_registros.index = pd.RangeIndex(1, len(registros) + 1, name="Núm.")
